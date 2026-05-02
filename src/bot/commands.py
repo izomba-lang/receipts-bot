@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+import logging
+import tempfile
+import uuid
+from datetime import date
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ContextTypes
+
+from src.bot.handlers import CURRENCY_SYMBOLS, owner_only
+from src.report.builder import build_report
+from src.report.fx import FxRateProvider
+from src.storage.repository import ReceiptRepository
+from src.utils.clustering import cluster_receipts, suggest_trip_name
+from src.utils.dates import parse_report_range
+
+logger = logging.getLogger(__name__)
+
+
+async def _resolve_trip(
+    repo: ReceiptRepository, user_id: str, query: str
+) -> dict[str, Any] | None:
+    if query.isdigit():
+        return await repo.get_trip(user_id, int(query))
+    return await repo.find_trip_by_name(user_id, query)
+
+
+def _parse_quoted_args(text: str) -> list[str]:
+    import shlex
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
+
+EDITABLE_FIELDS = {
+    "amount", "currency", "category", "provider", "date",
+    "from_location", "to_location", "payment_method", "notes",
+    "time", "receipt_number", "trip_number",
+}
+
+
+@owner_only
+async def handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    args = context.args
+    arg = args[0] if args else None
+
+    trip: dict[str, Any] | None = None
+    receipts: list[dict[str, Any]]
+    label: str
+    filename: str
+
+    if arg and arg.startswith("trip:"):
+        query = arg[len("trip:"):]
+        trip = await _resolve_trip(repo, user_id, query)
+        if not trip:
+            await update.message.reply_text(f"❌ Trip not found: {query}")
+            return
+        start = date.fromisoformat(trip["start_date"])
+        end = date.fromisoformat(trip["end_date"])
+        receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+        label = trip["name"]
+        safe_name = "".join(c if c.isalnum() else "_" for c in trip["name"])
+        filename = f"expense_report_{safe_name}.xlsx"
+    else:
+        try:
+            start, end = parse_report_range(arg)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        receipts = await repo.get_receipts_in_range(user_id, start, end)
+        label = f"{start} → {end}"
+        filename = f"expense_report_{start}_{end}.xlsx"
+
+    await update.message.reply_text(f"📊 Generating report for {label}…")
+
+    if not receipts:
+        await update.message.reply_text("No receipts found for this period.")
+        return
+
+    fx = FxRateProvider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / filename
+            override = label if trip else None
+            await build_report(receipts, start, end, path, fx, title_override=override)
+
+            await update.message.reply_document(
+                document=path.open("rb"),
+                filename=filename,
+                caption=f"Expense report: {label} ({len(receipts)} receipts)",
+            )
+    finally:
+        await fx.close()
+
+
+@owner_only
+async def handle_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    args = context.args
+    arg = args[0] if args else None
+
+    receipts: list[dict[str, Any]]
+    label: str
+
+    if arg and arg.startswith("trip:"):
+        query = arg[len("trip:"):]
+        trip = await _resolve_trip(repo, user_id, query)
+        if not trip:
+            await update.message.reply_text(f"❌ Trip not found: {query}")
+            return
+        receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+        label = f"trip {trip['name']}"
+    else:
+        try:
+            start, end = parse_report_range(arg)
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        receipts = await repo.get_receipts_in_range(user_id, start, end)
+        label = f"{start} → {end}"
+
+    if not receipts:
+        await update.message.reply_text("No receipts found for this period.")
+        return
+
+    lines: list[str] = [f"📋 Receipts for {label}:\n"]
+    for r in receipts:
+        rid = r["id"]
+        d = r.get("date", "")
+        provider = r.get("provider") or "—"
+        amount = r.get("amount", 0)
+        currency = r.get("currency", "")
+        status = r.get("status", "")
+        sym = CURRENCY_SYMBOLS.get(currency, "")
+        amount_str = f"{sym}{float(amount):,.2f}" if sym else f"{float(amount):,.2f} {currency}"
+        flag = " ⚠️" if status == "pending_review" else ""
+        lines.append(f"  #{rid} · {d} · {provider} · {amount_str}{flag}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@owner_only
+async def handle_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    args = context.args or []
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /edit <id> <field>=<value>\n"
+            f"Fields: {', '.join(sorted(EDITABLE_FIELDS))}"
+        )
+        return
+
+    try:
+        receipt_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid receipt ID.")
+        return
+
+    updates: dict[str, Any] = {}
+    for part in args[1:]:
+        if "=" not in part:
+            await update.message.reply_text(f"❌ Invalid format: {part}. Use field=value.")
+            return
+        field, value = part.split("=", 1)
+        if field not in EDITABLE_FIELDS:
+            await update.message.reply_text(
+                f"❌ Unknown field: {field}. "
+                f"Allowed: {', '.join(sorted(EDITABLE_FIELDS))}"
+            )
+            return
+
+        if field == "amount":
+            try:
+                v = Decimal(value)
+                if v <= 0:
+                    await update.message.reply_text("❌ Amount must be positive.")
+                    return
+                updates[field] = str(v)
+            except InvalidOperation:
+                await update.message.reply_text("❌ Invalid amount.")
+                return
+        elif field == "date":
+            try:
+                date.fromisoformat(value)
+                updates[field] = value
+            except ValueError:
+                await update.message.reply_text("❌ Invalid date. Use YYYY-MM-DD.")
+                return
+        else:
+            updates[field] = value
+
+    await repo.update_receipt(receipt_id, updates)
+    fields = ", ".join(f"{k}={v}" for k, v in updates.items())
+    await update.message.reply_text(f"✅ Receipt #{receipt_id} updated: {fields}")
+
+
+@owner_only
+async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text("Usage: /delete <id>")
+        return
+
+    try:
+        receipt_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid receipt ID.")
+        return
+
+    context.user_data["last_deleted"] = receipt_id  # type: ignore[index]
+    await repo.soft_delete(receipt_id)
+    await update.message.reply_text(f"🗑 Receipt #{receipt_id} deleted. /undo to restore.")
+
+
+@owner_only
+async def handle_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    last = context.user_data.get("last_deleted")  # type: ignore[union-attr]
+    if last:
+        await repo.restore(int(last))
+        context.user_data.pop("last_deleted", None)  # type: ignore[union-attr]
+        await update.message.reply_text(f"♻️ Receipt #{last} restored.")
+        return
+
+    last_row = await repo.get_last_deleted(user_id)
+    if last_row:
+        await repo.restore(last_row["id"])
+        await update.message.reply_text(f"♻️ Receipt #{last_row['id']} restored.")
+    else:
+        await update.message.reply_text("Nothing to undo.")
+
+
+@owner_only
+async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    if context.user_data:
+        context.user_data.clear()  # type: ignore[union-attr]
+    await update.message.reply_text("Cleared. Ready for new input.")
+
+
+@owner_only
+async def handle_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message and update.message.text
+    repo: ReceiptRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    raw = update.message.text[len("/trip"):].strip()
+    parts = _parse_quoted_args(raw)
+
+    if not parts:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/trip new \"Name\" YYYY-MM-DD..YYYY-MM-DD\n"
+            "/trip list\n"
+            "/trip current\n"
+            "/trip suggest — auto-cluster unassigned receipts into trips\n"
+            "/trip assign <receipt_id> <trip_id|name>\n"
+            "/trip unassign <receipt_id>"
+        )
+        return
+
+    sub = parts[0].lower()
+
+    if sub == "new":
+        if len(parts) < 3:
+            await update.message.reply_text(
+                "Usage: /trip new \"Name\" YYYY-MM-DD..YYYY-MM-DD"
+            )
+            return
+        name = parts[1]
+        range_str = parts[2]
+        if ".." not in range_str:
+            await update.message.reply_text("❌ Range must be YYYY-MM-DD..YYYY-MM-DD")
+            return
+        try:
+            s_str, e_str = range_str.split("..", 1)
+            start = date.fromisoformat(s_str)
+            end = date.fromisoformat(e_str)
+        except ValueError:
+            await update.message.reply_text("❌ Invalid date format. Use YYYY-MM-DD..YYYY-MM-DD")
+            return
+        if end < start:
+            await update.message.reply_text("❌ End date is before start date.")
+            return
+        trip = await repo.create_trip(user_id, name, start, end)
+        await update.message.reply_text(
+            f"✅ Trip created: #{trip['id']} \"{trip['name']}\" "
+            f"({trip['start_date']} → {trip['end_date']})"
+        )
+
+    elif sub == "list":
+        trips = await repo.list_trips(user_id)
+        if not trips:
+            await update.message.reply_text("No trips yet. Create with /trip new")
+            return
+        lines = ["✈️ Trips:\n"]
+        for t in trips:
+            lines.append(f"  #{t['id']} \"{t['name']}\" · {t['start_date']} → {t['end_date']}")
+        await update.message.reply_text("\n".join(lines))
+
+    elif sub == "current":
+        today = date.today()
+        trip = await repo.find_trip_for_date(user_id, today)
+        if trip:
+            await update.message.reply_text(
+                f"✈️ Current trip: #{trip['id']} \"{trip['name']}\" "
+                f"({trip['start_date']} → {trip['end_date']})"
+            )
+        else:
+            await update.message.reply_text(f"No active trip on {today}.")
+
+    elif sub == "assign":
+        if len(parts) < 3:
+            await update.message.reply_text("Usage: /trip assign <receipt_id> <trip_id|name>")
+            return
+        try:
+            receipt_id = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid receipt ID.")
+            return
+        trip = await _resolve_trip(repo, user_id, parts[2])
+        if not trip:
+            await update.message.reply_text(f"❌ Trip not found: {parts[2]}")
+            return
+        await repo.assign_trip(receipt_id, trip["id"])
+        await update.message.reply_text(
+            f"✅ Receipt #{receipt_id} assigned to \"{trip['name']}\""
+        )
+
+    elif sub == "suggest":
+        receipts = await repo.get_unassigned_receipts(user_id)
+        if not receipts:
+            await update.message.reply_text("No unassigned receipts to cluster.")
+            return
+
+        clusters = cluster_receipts(receipts)
+        proposals: list[dict[str, Any]] = []
+        lines = ["✈️ Suggested trips:\n"]
+        for i, cluster in enumerate(clusters, 1):
+            name = suggest_trip_name(cluster)
+            first = str(cluster[0]["date"])
+            last = str(cluster[-1]["date"])
+            currencies = sorted({(r.get("currency") or "").upper() for r in cluster})
+            proposals.append({
+                "name": name,
+                "start": first,
+                "end": last,
+                "receipt_ids": [r["id"] for r in cluster],
+            })
+            lines.append(
+                f"{i}. \"{name}\" — {first} → {last} "
+                f"({len(cluster)} receipts, {'/'.join(currencies)})"
+            )
+
+        proposal_id = uuid.uuid4().hex[:8]
+        context.user_data[f"trip_proposal_{proposal_id}"] = proposals  # type: ignore[index]
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✓ Create all", callback_data=f"trip_create_all:{proposal_id}"
+            ),
+            InlineKeyboardButton(
+                "✗ Cancel", callback_data=f"trip_cancel:{proposal_id}"
+            ),
+        ]])
+        lines.append("\nCreate these trips and attach receipts?")
+        await update.message.reply_text("\n".join(lines), reply_markup=keyboard)
+
+    elif sub == "unassign":
+        if len(parts) < 2:
+            await update.message.reply_text("Usage: /trip unassign <receipt_id>")
+            return
+        try:
+            receipt_id = int(parts[1])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid receipt ID.")
+            return
+        await repo.assign_trip(receipt_id, None)
+        await update.message.reply_text(f"✅ Receipt #{receipt_id} unassigned from trip.")
+
+    else:
+        await update.message.reply_text(f"❌ Unknown subcommand: {sub}")
