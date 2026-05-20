@@ -62,7 +62,7 @@ class ClaudeExtractor:
     ) -> ExtractedReceipt | ExtractionError:
         response = await self._client.messages.create(
             model=self._model,
-            max_tokens=1024,
+            max_tokens=4096,
             system=RECEIPT_EXTRACTION_SYSTEM,
             messages=[{"role": "user", "content": content}],
         )
@@ -70,10 +70,24 @@ class ClaudeExtractor:
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
 
-        logger.debug("Claude raw response: %s", raw)
-        data = json.loads(raw)
+        logger.debug("Claude raw response (stop=%s): %s", response.stop_reason, raw)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            logger.error(
+                "Claude returned invalid JSON (stop_reason=%s, len=%d): %s | error: %s",
+                response.stop_reason, len(raw), raw[:500], e,
+            )
+            return ExtractionError(
+                error=f"claude_invalid_json (stop_reason={response.stop_reason})"
+            )
 
         if "error" in data:
             return ExtractionError(**data)
 
-        return ExtractedReceipt(**data)
+        try:
+            return ExtractedReceipt(**data)
+        except Exception as e:
+            logger.error("Failed to parse ExtractedReceipt: %s | data: %s", e, data)
+            return ExtractionError(error=f"schema_mismatch: {e}")

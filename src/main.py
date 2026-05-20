@@ -6,10 +6,12 @@ import os
 
 from aiohttp import web
 from dotenv import load_dotenv
+from telegram import Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -88,6 +90,22 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error("Handler error: %s", context.error, exc_info=context.error)
+        if isinstance(update, Update) and update.effective_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=(
+                        f"⚠️ Something went wrong while processing that. "
+                        f"Try resending. (Error: {type(context.error).__name__})"
+                    ),
+                )
+            except Exception:
+                pass
+
+    app.add_error_handler(on_error)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
