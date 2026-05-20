@@ -115,10 +115,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     sha = sha256_digest(image_bytes)
     existing = await repo.find_by_hash(user_id, sha)
     if existing:
-        context.user_data[f"dup_{sha}"] = {"image_bytes": image_bytes, "sha": sha}  # type: ignore[index]
+        context.user_data[f"dup_{sha}"] = {  # type: ignore[index]
+            "file_bytes": image_bytes,
+            "source_kind": "photo",
+            "ext": "jpg",
+            "content_type": "image/jpeg",
+            "existing_id": existing["id"],
+        }
         await update.message.reply_text(
-            f"⚠️ This looks like a duplicate of #{existing['id']}. Save anyway?",
-            reply_markup=duplicate_keyboard(existing["id"], sha),
+            f"⚠️ Duplicate of #{existing['id']} "
+            f"({existing.get('provider') or '—'} · {existing.get('date')}).\n"
+            f"What do you want to do?",
+            reply_markup=duplicate_keyboard(sha),
         )
         return
 
@@ -153,13 +161,31 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     file = await doc.get_file()
     file_bytes = bytes(await file.download_as_bytearray())
 
+    if mime == "application/pdf":
+        source_kind = "pdf"
+        ext = "pdf"
+        content_type = "application/pdf"
+    else:
+        media_type = mime if "/" in mime else "image/jpeg"
+        source_kind = "document"
+        ext = mime.split("/")[-1] if "/" in mime else "jpg"
+        content_type = mime
+
     sha = sha256_digest(file_bytes)
     existing = await repo.find_by_hash(user_id, sha)
     if existing:
-        context.user_data[f"dup_{sha}"] = {"file_bytes": file_bytes, "sha": sha, "mime": mime}  # type: ignore[index]
+        context.user_data[f"dup_{sha}"] = {  # type: ignore[index]
+            "file_bytes": file_bytes,
+            "source_kind": source_kind,
+            "ext": ext,
+            "content_type": content_type,
+            "existing_id": existing["id"],
+        }
         await update.message.reply_text(
-            f"⚠️ This looks like a duplicate of #{existing['id']}. Save anyway?",
-            reply_markup=duplicate_keyboard(existing["id"], sha),
+            f"⚠️ Duplicate of #{existing['id']} "
+            f"({existing.get('provider') or '—'} · {existing.get('date')}).\n"
+            f"What do you want to do?",
+            reply_markup=duplicate_keyboard(sha),
         )
         return
 
@@ -167,15 +193,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if mime == "application/pdf":
         result = await extractor.extract_from_pdf(file_bytes, anchor)
-        source_kind = "pdf"
-        ext = "pdf"
-        content_type = "application/pdf"
     else:
-        media_type = mime if "/" in mime else "image/jpeg"
         result = await extractor.extract_from_image(file_bytes, media_type, anchor)
-        source_kind = "document"
-        ext = mime.split("/")[-1] if "/" in mime else "jpg"
-        content_type = mime
 
     if isinstance(result, ExtractionError):
         await update.message.reply_text(
@@ -258,18 +277,57 @@ async def handle_callback(
         await repo.soft_delete(receipt_id)
         await query.edit_message_text(f"🗑 Receipt #{receipt_id} discarded.")
 
-    elif data.startswith("dup_save:"):
-        sha = data.split(":")[1]
-        pending = context.user_data.get(f"dup_{sha}")  # type: ignore[union-attr]
-        if pending:
-            await query.edit_message_text("Saving duplicate…")
-        else:
-            await query.edit_message_text("Session expired. Please resend the receipt.")
-
     elif data.startswith("dup_skip:"):
-        sha = data.split(":")[1]
+        sha = data.split(":", 1)[1]
         context.user_data.pop(f"dup_{sha}", None)  # type: ignore[union-attr]
-        await query.edit_message_text("Skipped.")
+        await query.edit_message_text("⏭ Skipped — nothing saved.")
+
+    elif data.startswith("dup_new:") or data.startswith("dup_replace:"):
+        action, sha = data.split(":", 1)
+        pending = context.user_data.pop(f"dup_{sha}", None)  # type: ignore[union-attr]
+        if not pending:
+            await query.edit_message_text("Session expired. Resend the file.")
+            return
+
+        extractor: ClaudeExtractor = context.bot_data["extractor"]
+        user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+        anchor = date.today().isoformat()
+
+        await query.edit_message_text("⏳ Extracting…")
+        result = await _extract_pending(extractor, pending, anchor)
+
+        if isinstance(result, ExtractionError):
+            await query.edit_message_text(f"⚠️ Could not parse: {result.error}")
+            return
+        if result.date > date.today():
+            await query.edit_message_text("❌ Date is in the future — skipped.")
+            return
+
+        if action == "dup_replace":
+            saved = await repo.replace_receipt(
+                pending["existing_id"], user_id, result, pending["source_kind"],
+                file_bytes=pending["file_bytes"],
+                file_ext=pending["ext"],
+                file_content_type=pending["content_type"],
+            )
+            await query.edit_message_text(
+                f"🔄 Replaced #{pending['existing_id']}.\n\n"
+                + _format_confirmation({**saved, "id": pending["existing_id"]}).replace(
+                    "✅ Saved", "🔄 Updated"
+                )
+            )
+        else:  # dup_new
+            saved = await repo.save_receipt(
+                user_id, result, pending["source_kind"],
+                file_bytes=pending["file_bytes"],
+                file_ext=pending["ext"],
+                file_content_type=pending["content_type"],
+                status="confirmed" if result.confidence >= 0.7 else "pending_review",
+            )
+            await repo.update_receipt(saved["id"], {"notes": f"sha256:{sha}"})
+            await query.edit_message_text(
+                f"➕ Saved as new entry.\n\n{_format_confirmation(saved)}"
+            )
 
     elif data.startswith("trip_create_all:"):
         proposal_id = data.split(":", 1)[1]
@@ -299,6 +357,17 @@ async def handle_callback(
         proposal_id = data.split(":", 1)[1]
         context.user_data.pop(f"trip_proposal_{proposal_id}", None)  # type: ignore[union-attr]
         await query.edit_message_text("Cancelled.")
+
+
+async def _extract_pending(
+    extractor: ClaudeExtractor, pending: dict[str, Any], anchor: str
+) -> ExtractedReceipt | ExtractionError:
+    kind = pending["source_kind"]
+    file_bytes = pending["file_bytes"]
+    if kind == "pdf":
+        return await extractor.extract_from_pdf(file_bytes, anchor)
+    media_type = pending.get("content_type") or "image/jpeg"
+    return await extractor.extract_from_image(file_bytes, media_type, anchor)
 
 
 async def _process_image(

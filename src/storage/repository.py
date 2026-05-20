@@ -62,6 +62,51 @@ class ReceiptRepository:
 
         return saved
 
+    async def replace_receipt(
+        self,
+        receipt_id: int,
+        user_id: str,
+        extracted: ExtractedReceipt,
+        source_kind: str,
+        file_bytes: bytes | None = None,
+        file_ext: str = "jpg",
+        file_content_type: str = "image/jpeg",
+    ) -> dict[str, Any]:
+        trip = await self.find_trip_for_date(user_id, extracted.date)
+        updates = {
+            "date": extracted.date.isoformat(),
+            "time": extracted.time.isoformat() if extracted.time else None,
+            "provider": extracted.provider,
+            "category": extracted.category,
+            "amount": str(extracted.amount),
+            "currency": extracted.currency.upper(),
+            "from_location": extracted.from_location,
+            "to_location": extracted.to_location,
+            "receipt_number": extracted.receipt_number,
+            "trip_number": extracted.trip_number,
+            "payment_method": extracted.payment_method,
+            "source_kind": source_kind,
+            "raw_text": extracted.raw_extracted_text or None,
+            "confidence": extracted.confidence,
+            "status": "confirmed",
+            "trip_id": trip["id"] if trip else None,
+        }
+        updated = await self.update_receipt(receipt_id, updates)
+        if trip:
+            updated["_trip_name"] = trip["name"]
+
+        if file_bytes:
+            path = f"{user_id}/{receipt_id}.{file_ext}"
+            storage_path = await self._db.upload_file(
+                self._bucket, path, file_bytes, file_content_type
+            )
+            await self._db.update(
+                "receipts", {"id": receipt_id}, {"source_file_id": storage_path}
+            )
+            updated["source_file_id"] = storage_path
+
+        return updated
+
     async def get_receipts(
         self, user_id: str, start: date, end: date
     ) -> list[dict[str, Any]]:

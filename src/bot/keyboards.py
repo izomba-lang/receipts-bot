@@ -13,16 +13,11 @@ def confirm_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def duplicate_keyboard(
-    existing_id: int, new_receipt_data_key: str
-) -> InlineKeyboardMarkup:
+def duplicate_keyboard(sha: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "Save anyway", callback_data=f"dup_save:{new_receipt_data_key}"
-            ),
-            InlineKeyboardButton(
-                "Skip", callback_data=f"dup_skip:{new_receipt_data_key}"
-            ),
+            InlineKeyboardButton("⏭ Skip", callback_data=f"dup_skip:{sha}"),
+            InlineKeyboardButton("🔄 Replace", callback_data=f"dup_replace:{sha}"),
+            InlineKeyboardButton("➕ Save as new", callback_data=f"dup_new:{sha}"),
         ]
     ])
