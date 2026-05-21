@@ -7,7 +7,7 @@ from typing import Any
 from telegram import PhotoSize, Update
 from telegram.ext import ContextTypes
 
-from src.bot.keyboards import confirm_keyboard, duplicate_keyboard
+from src.bot.keyboards import confirm_keyboard, duplicate_keyboard, merge_keyboard
 from src.extraction.claude_client import ClaudeExtractor
 from src.extraction.schemas import ExtractedReceipt, ExtractionError
 from src.storage.repository import ReceiptRepository
@@ -358,6 +358,30 @@ async def handle_callback(
         context.user_data.pop(f"trip_proposal_{proposal_id}", None)  # type: ignore[union-attr]
         await query.edit_message_text("Cancelled.")
 
+    elif data.startswith("merge:"):
+        _, new_id_s, cand_id_s = data.split(":")
+        user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+        new_r = await repo.get_receipt(user_id, int(new_id_s))
+        cand_r = await repo.get_receipt(user_id, int(cand_id_s))
+        if not new_r or not cand_r:
+            await query.edit_message_text("One of the receipts no longer exists.")
+            return
+        # Larger amount stays as the counted (primary); the other is the attachment
+        if float(new_r["amount"]) >= float(cand_r["amount"]):
+            primary, attachment = new_r, cand_r
+        else:
+            primary, attachment = cand_r, new_r
+        await repo.merge_receipts(primary["id"], attachment["id"])
+        await query.edit_message_text(
+            f"🔗 Merged. #{primary['id']} "
+            f"({float(primary['amount']):,.2f} {primary['currency']}) is counted; "
+            f"#{attachment['id']} is now a supporting document.\n"
+            f"Undo with /unmerge {attachment['id']}"
+        )
+
+    elif data.startswith("merge_no:"):
+        await query.edit_message_text("Kept as separate receipts.")
+
 
 async def _extract_pending(
     extractor: ClaudeExtractor, pending: dict[str, Any], anchor: str
@@ -435,3 +459,17 @@ async def _save_and_reply(
         )
     else:
         await update.message.reply_text(_format_confirmation(saved))
+
+    # Offer to merge if a recent receipt on the same date looks like the same payment
+    candidate = await repo.find_merge_candidate(user_id, result.date, saved)
+    if candidate:
+        cand_amount = candidate.get("amount", 0)
+        cand_curr = candidate.get("currency", "")
+        cand_provider = candidate.get("provider") or "—"
+        await update.message.reply_text(
+            f"🔗 This looks like the same payment as #{candidate['id']} "
+            f"({cand_provider} · {float(cand_amount):,.2f} {cand_curr}).\n"
+            f"Merge them? The larger amount counts; the other becomes a "
+            f"supporting document (not double-counted).",
+            reply_markup=merge_keyboard(receipt_id, candidate["id"]),
+        )

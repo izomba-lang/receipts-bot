@@ -21,3 +21,17 @@ def duplicate_keyboard(sha: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("➕ Save as new", callback_data=f"dup_new:{sha}"),
         ]
     ])
+
+
+def merge_keyboard(new_id: int, candidate_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔗 Merge (same payment)",
+                callback_data=f"merge:{new_id}:{candidate_id}",
+            ),
+            InlineKeyboardButton(
+                "❌ Separate", callback_data=f"merge_no:{new_id}"
+            ),
+        ]
+    ])

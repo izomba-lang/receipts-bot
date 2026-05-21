@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from src.extraction.schemas import ExtractedReceipt
@@ -121,18 +121,19 @@ class ReceiptRepository:
         )
 
     async def get_receipts_in_range(
-        self, user_id: str, start: date, end: date
+        self, user_id: str, start: date, end: date,
+        include_attachments: bool = False,
     ) -> list[dict[str, Any]]:
         filters = {
             "user_id": f"eq.{user_id}",
             "status": "neq.deleted",
+            "and": f"(date.gte.{start.isoformat()},date.lte.{end.isoformat()})",
         }
+        if not include_attachments:
+            filters["parent_id"] = "is.null"
         resp = await self._db.select(
             "receipts",
-            filters={
-                **filters,
-                "and": f"(date.gte.{start.isoformat()},date.lte.{end.isoformat()})",
-            },
+            filters=filters,
             order="date.asc,time.asc",
         )
         return resp
@@ -240,15 +241,19 @@ class ReceiptRepository:
         return rows[0] if rows else None
 
     async def get_receipts_by_trip(
-        self, user_id: str, trip_id: int
+        self, user_id: str, trip_id: int,
+        include_attachments: bool = False,
     ) -> list[dict[str, Any]]:
+        filters = {
+            "user_id": f"eq.{user_id}",
+            "trip_id": f"eq.{trip_id}",
+            "status": "neq.deleted",
+        }
+        if not include_attachments:
+            filters["parent_id"] = "is.null"
         return await self._db.select(
             "receipts",
-            filters={
-                "user_id": f"eq.{user_id}",
-                "trip_id": f"eq.{trip_id}",
-                "status": "neq.deleted",
-            },
+            filters=filters,
             order="date.asc,time.asc",
         )
 
@@ -262,6 +267,50 @@ class ReceiptRepository:
                 "user_id": f"eq.{user_id}",
                 "trip_id": "is.null",
                 "status": "neq.deleted",
+                "parent_id": "is.null",
             },
             order="date.asc,time.asc",
         )
+
+    async def get_receipt(self, user_id: str, receipt_id: int) -> dict[str, Any] | None:
+        rows = await self._db.select(
+            "receipts",
+            filters={"user_id": f"eq.{user_id}", "id": f"eq.{receipt_id}"},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def find_merge_candidate(
+        self, user_id: str, on_date: date, new_receipt: dict[str, Any],
+        within_minutes: int = 5,
+    ) -> dict[str, Any] | None:
+        """Find a recently-captured receipt on the same date that the new one
+        likely belongs to (same payment: bill + fiscal receipt)."""
+        created_raw = new_receipt.get("created_at")
+        if not created_raw:
+            return None
+        created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        cutoff = (created - timedelta(minutes=within_minutes)).isoformat()
+
+        rows = await self._db.select(
+            "receipts",
+            filters={
+                "user_id": f"eq.{user_id}",
+                "date": f"eq.{on_date.isoformat()}",
+                "status": "neq.deleted",
+                "parent_id": "is.null",
+                "id": f"neq.{new_receipt['id']}",
+                "created_at": f"gte.{cutoff}",
+            },
+            order="created_at.desc",
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def merge_receipts(
+        self, primary_id: int, attachment_id: int
+    ) -> None:
+        await self.update_receipt(attachment_id, {"parent_id": primary_id})
+
+    async def unmerge_receipt(self, receipt_id: int) -> dict[str, Any]:
+        return await self.update_receipt(receipt_id, {"parent_id": None})

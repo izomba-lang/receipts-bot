@@ -96,5 +96,19 @@ class SupabaseClient:
         resp.raise_for_status()
         return f"{bucket}/{path}"
 
+    async def download_file(self, storage_path: str) -> bytes:
+        # storage_path is "bucket/path/to/file"
+        bucket, _, path = storage_path.partition("/")
+        headers = {
+            "apikey": self._headers["apikey"],
+            "Authorization": self._headers["Authorization"],
+        }
+        resp = await self._http.get(
+            f"{self.storage_url}/object/{bucket}/{path}",
+            headers=headers,
+        )
+        resp.raise_for_status()
+        return resp.content
+
     async def close(self) -> None:
         await self._http.aclose()

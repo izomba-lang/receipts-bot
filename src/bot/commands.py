@@ -12,9 +12,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.bot.handlers import CURRENCY_SYMBOLS, owner_only
+from src.export.drive import DriveClient
 from src.report.builder import build_report
 from src.report.fx import FxRateProvider
 from src.storage.repository import ReceiptRepository
+from src.storage.supabase_client import SupabaseClient
 from src.utils.clustering import cluster_receipts, suggest_trip_name
 from src.utils.dates import parse_report_range
 
@@ -302,10 +304,23 @@ async def handle_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("❌ End date is before start date.")
             return
         trip = await repo.create_trip(user_id, name, start, end)
-        await update.message.reply_text(
+
+        # Auto-attach existing unassigned receipts whose date falls in range
+        unassigned = await repo.get_unassigned_receipts(user_id)
+        in_range = [
+            r for r in unassigned
+            if start <= date.fromisoformat(r["date"]) <= end
+        ]
+        for r in in_range:
+            await repo.assign_trip(r["id"], trip["id"])
+
+        msg = (
             f"✅ Trip created: #{trip['id']} \"{trip['name']}\" "
             f"({trip['start_date']} → {trip['end_date']})"
         )
+        if in_range:
+            msg += f"\n🔗 Auto-attached {len(in_range)} existing receipts."
+        await update.message.reply_text(msg)
 
     elif sub == "list":
         trips = await repo.list_trips(user_id)
@@ -399,3 +414,177 @@ async def handle_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     else:
         await update.message.reply_text(f"❌ Unknown subcommand: {sub}")
+
+
+def _safe_filename(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
+
+
+def _receipt_filename(idx: int, r: dict[str, Any]) -> str:
+    d = str(r.get("date", "nodate"))
+    provider = _safe_filename((r.get("provider") or "unknown")[:30])
+    amount = r.get("amount", 0)
+    currency = (r.get("currency") or "").upper()
+    src_path = r.get("source_file_id") or ""
+    ext = src_path.rsplit(".", 1)[-1] if "." in src_path else "jpg"
+    return f"{idx:02d}_{d}_{provider}_{float(amount):.0f}{currency}.{ext}"
+
+
+@owner_only
+async def handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    sb: SupabaseClient = context.bot_data["sb_client"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    args = context.args
+    if not args or not args[0].startswith("trip:"):
+        await update.message.reply_text(
+            "Usage: /export trip:<name|id>\n"
+            "Generates xlsx + uploads originals to Google Drive."
+        )
+        return
+
+    query = args[0][len("trip:"):]
+    trip = await _resolve_trip(repo, user_id, query)
+    if not trip:
+        await update.message.reply_text(f"❌ Trip not found: {query}")
+        return
+
+    # report rows exclude attachments (no double-counting); file upload includes all
+    receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+    all_files = await repo.get_receipts_by_trip(
+        user_id, trip["id"], include_attachments=True
+    )
+    if not receipts:
+        await update.message.reply_text("Trip has no receipts.")
+        return
+
+    n_attach = len(all_files) - len(receipts)
+    await update.message.reply_text(
+        f"📤 Exporting {len(receipts)} receipts"
+        f"{f' (+{n_attach} attachments)' if n_attach else ''} "
+        f"for \"{trip['name']}\"…"
+    )
+
+    start = date.fromisoformat(trip["start_date"])
+    end = date.fromisoformat(trip["end_date"])
+
+    drive = DriveClient()
+    expenses_root = drive.find_or_create_folder("Expenses")
+    folder_name = f"{trip['name']} ({trip['start_date']} → {trip['end_date']})"
+    folder_id = drive.create_folder(folder_name, parent_id=expenses_root)
+    logger.info(
+        "Created Drive folder %s inside Expenses (%s/%s)",
+        folder_name, expenses_root, folder_id,
+    )
+
+    # Build and upload the xlsx report
+    fx = FxRateProvider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx_path = Path(tmp) / f"{_safe_filename(trip['name'])}_report.xlsx"
+            await build_report(
+                receipts, start, end, xlsx_path, fx, title_override=trip["name"]
+            )
+            drive.upload_file(
+                xlsx_path.name,
+                xlsx_path.read_bytes(),
+                folder_id,
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+    finally:
+        await fx.close()
+
+    # Download and upload every original (primary receipts + their attachments)
+    uploaded = 0
+    skipped = 0
+    for idx, r in enumerate(all_files, 1):
+        src = r.get("source_file_id")
+        if not src:
+            skipped += 1
+            continue
+        try:
+            data = await sb.download_file(src)
+            suffix = "_attachment" if r.get("parent_id") else ""
+            fname = _receipt_filename(idx, r)
+            if suffix:
+                stem, _, ext = fname.rpartition(".")
+                fname = f"{stem}{suffix}.{ext}"
+            drive.upload_file(fname, data, folder_id)
+            uploaded += 1
+        except Exception as e:
+            logger.error("Failed to upload receipt #%d: %s", r.get("id"), e)
+            skipped += 1
+
+    share_url = drive.make_shareable(folder_id)
+
+    summary = (
+        f"✅ Export complete: \"{trip['name']}\"\n\n"
+        f"📊 Report: 1 xlsx\n"
+        f"🧾 Receipts: {uploaded} uploaded"
+        f"{f', {skipped} skipped (no original)' if skipped else ''}\n\n"
+        f"🔗 {share_url}\n\n"
+        f"Anyone with the link can view."
+    )
+    await update.message.reply_text(summary, disable_web_page_preview=True)
+
+
+@owner_only
+async def handle_merge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+    args = context.args or []
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /merge <attachment_id> <primary_id>\n"
+            "Marks the first receipt as a supporting document of the second "
+            "(only the primary counts in totals)."
+        )
+        return
+
+    try:
+        attachment_id = int(args[0])
+        primary_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ IDs must be numbers.")
+        return
+
+    primary = await repo.get_receipt(user_id, primary_id)
+    attachment = await repo.get_receipt(user_id, attachment_id)
+    if not primary or not attachment:
+        await update.message.reply_text("❌ One of the receipts doesn't exist.")
+        return
+
+    await repo.merge_receipts(primary_id, attachment_id)
+    await update.message.reply_text(
+        f"🔗 #{attachment_id} is now a supporting document of #{primary_id}. "
+        f"Only #{primary_id} counts in reports.\nUndo: /unmerge {attachment_id}"
+    )
+
+
+@owner_only
+async def handle_unmerge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text("Usage: /unmerge <receipt_id>")
+        return
+
+    try:
+        receipt_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid receipt ID.")
+        return
+
+    await repo.unmerge_receipt(receipt_id)
+    await update.message.reply_text(
+        f"✅ #{receipt_id} is a standalone receipt again (counts in totals)."
+    )

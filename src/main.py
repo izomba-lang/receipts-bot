@@ -20,10 +20,13 @@ from src.bot.commands import (
     handle_cancel,
     handle_delete,
     handle_edit,
+    handle_export,
     handle_list,
+    handle_merge,
     handle_report,
     handle_trip,
     handle_undo,
+    handle_unmerge,
 )
 from src.bot.handlers import (
     handle_callback,
@@ -76,6 +79,7 @@ def main() -> None:
     app.bot_data["repo"] = repo
     app.bot_data["extractor"] = extractor
     app.bot_data["config"] = config
+    app.bot_data["sb_client"] = sb_client
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("help", handle_help))
@@ -86,6 +90,9 @@ def main() -> None:
     app.add_handler(CommandHandler("undo", handle_undo))
     app.add_handler(CommandHandler("cancel", handle_cancel))
     app.add_handler(CommandHandler("trip", handle_trip))
+    app.add_handler(CommandHandler("export", handle_export))
+    app.add_handler(CommandHandler("merge", handle_merge))
+    app.add_handler(CommandHandler("unmerge", handle_unmerge))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
