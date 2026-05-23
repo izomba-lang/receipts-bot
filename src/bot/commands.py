@@ -432,9 +432,9 @@ def _receipt_filename(idx: int, r: dict[str, Any]) -> str:
 
 async def run_trip_export(
     repo: ReceiptRepository, sb: SupabaseClient, user_id: str, trip: dict[str, Any]
-) -> str:
+) -> dict[str, Any]:
     """Build the xlsx report + upload all originals to a Drive folder.
-    Returns a summary string with the shareable link. Raises if no receipts."""
+    Returns {share_url, uploaded, n_attach, skipped, receipts}. Raises if empty."""
     receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
     all_files = await repo.get_receipts_by_trip(
         user_id, trip["id"], include_attachments=True
@@ -494,14 +494,54 @@ async def run_trip_export(
 
     share_url = drive.make_shareable(folder_id)
     n_attach = len(all_files) - len(receipts)
+    return {
+        "share_url": share_url,
+        "uploaded": uploaded,
+        "n_attach": n_attach,
+        "skipped": skipped,
+        "receipts": receipts,
+    }
+
+
+def format_export_summary(trip: dict[str, Any], res: dict[str, Any]) -> str:
+    n_attach = res["n_attach"]
+    skipped = res["skipped"]
     return (
         f"✅ Export complete: \"{trip['name']}\"\n\n"
         f"📊 Report: 1 xlsx\n"
-        f"🧾 Receipts: {uploaded} uploaded"
+        f"🧾 Receipts: {res['uploaded']} uploaded"
         f"{f' (incl. {n_attach} attachments)' if n_attach else ''}"
         f"{f', {skipped} skipped (no original)' if skipped else ''}\n\n"
-        f"🔗 {share_url}\n\n"
+        f"🔗 {res['share_url']}\n\n"
         f"Anyone with the link can view."
+    )
+
+
+def build_forwardable_summary(trip: dict[str, Any], res: dict[str, Any]) -> str:
+    """Clean Russian summary the user can forward to an assistant/finance."""
+    from collections import defaultdict
+
+    by_cur: dict[str, float] = defaultdict(float)
+    for r in res["receipts"]:
+        by_cur[(r.get("currency") or "").upper()] += float(r.get("amount") or 0)
+
+    cur_lines = "\n".join(
+        f"• {cur} — {total:,.2f}"
+        for cur, total in sorted(by_cur.items(), key=lambda kv: -kv[1])
+    )
+    n = len(res["receipts"])
+    start = trip["start_date"]
+    end = trip["end_date"]
+    return (
+        f"📋 Авансовый отчёт — {trip['name']}\n"
+        f"🗓 {start} — {end}\n\n"
+        f"Все чеки и итоговый отчёт (Excel) с пересчётом в AED:\n"
+        f"{res['share_url']}\n\n"
+        f"Всего {n} чек(ов). Суммы по валютам:\n"
+        f"{cur_lines}\n\n"
+        f"Итоговая сумма к возмещению в AED — в файле Excel "
+        f"(колонка Amount AED, строка TOTAL); курсы применены по дате каждого платежа.\n\n"
+        f"Оригиналы всех чеков лежат в той же папке, названы по дате и поставщику."
     )
 
 
@@ -528,11 +568,13 @@ async def handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text(f"📤 Exporting \"{trip['name']}\"…")
     try:
-        summary = await run_trip_export(repo, sb, user_id, trip)
+        res = await run_trip_export(repo, sb, user_id, trip)
     except ValueError as e:
         await update.message.reply_text(f"❌ {e}")
         return
-    await update.message.reply_text(summary, disable_web_page_preview=True)
+    await update.message.reply_text(
+        format_export_summary(trip, res), disable_web_page_preview=True
+    )
 
 
 @owner_only
@@ -551,14 +593,17 @@ async def handle_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🏁 Closing \"{trip['name']}\" and generating the final report…"
     )
     try:
-        summary = await run_trip_export(repo, sb, user_id, trip)
+        res = await run_trip_export(repo, sb, user_id, trip)
     except ValueError as e:
         await update.message.reply_text(f"❌ {e}")
         return
     await repo.close_trip(trip["id"])
     await update.message.reply_text(
-        f"{summary}\n\n🏁 Trip \"{trip['name']}\" closed.",
-        disable_web_page_preview=True,
+        f"🏁 Trip \"{trip['name']}\" closed.", disable_web_page_preview=True
+    )
+    # Forwardable summary for the assistant / finance
+    await update.message.reply_text(
+        build_forwardable_summary(trip, res), disable_web_page_preview=True
     )
 
 

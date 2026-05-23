@@ -351,7 +351,7 @@ async def handle_callback(
         )
 
     elif data.startswith("close:"):
-        from src.bot.commands import run_trip_export
+        from src.bot.commands import build_forwardable_summary, run_trip_export
 
         trip_id = int(data.split(":")[1])
         user_id = str(update.effective_user.id)  # type: ignore[union-attr]
@@ -367,14 +367,15 @@ async def handle_callback(
             f"🏁 Closing \"{trip['name']}\" and generating the final report…"
         )
         try:
-            summary = await run_trip_export(repo, sb, user_id, trip)
+            res = await run_trip_export(repo, sb, user_id, trip)
         except ValueError as e:
             await query.edit_message_text(f"❌ {e}")
             return
         await repo.close_trip(trip_id)
         if query.message:
+            await query.message.reply_text(f"🏁 Trip \"{trip['name']}\" closed.")
             await query.message.reply_text(
-                f"{summary}\n\n🏁 Trip \"{trip['name']}\" closed.",
+                build_forwardable_summary(trip, res),
                 disable_web_page_preview=True,
             )
 
