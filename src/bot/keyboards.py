@@ -23,6 +23,12 @@ def duplicate_keyboard(sha: str) -> InlineKeyboardMarkup:
     ])
 
 
+def saved_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"del:{receipt_id}")]
+    ])
+
+
 def merge_keyboard(new_id: int, candidate_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [

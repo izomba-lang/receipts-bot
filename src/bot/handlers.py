@@ -7,7 +7,12 @@ from typing import Any
 from telegram import PhotoSize, Update
 from telegram.ext import ContextTypes
 
-from src.bot.keyboards import confirm_keyboard, duplicate_keyboard, merge_keyboard
+from src.bot.keyboards import (
+    confirm_keyboard,
+    duplicate_keyboard,
+    merge_keyboard,
+    saved_keyboard,
+)
 from src.extraction.claude_client import ClaudeExtractor
 from src.extraction.schemas import ExtractedReceipt, ExtractionError
 from src.storage.repository import ReceiptRepository
@@ -35,7 +40,7 @@ def _format_confirmation(saved: dict[str, Any]) -> str:
     return (
         f"✅ Saved #{rid} — {provider} · {d} · {amount_fmt} · {category}"
         f"{trip_line}\n"
-        f"   Tap /edit {rid} to fix · /delete {rid} to remove"
+        f"   To fix, type: /edit {rid} amount=… (or use 🗑 below to remove)"
     )
 
 
@@ -249,11 +254,15 @@ async def handle_text_message(
         saved = await repo.save_receipt(
             user_id, result, "text", status="pending_review"
         )
-        await update.message.reply_text(_format_confirmation(saved))
+        await update.message.reply_text(
+            _format_confirmation(saved), reply_markup=saved_keyboard(saved["id"])
+        )
         return
 
     saved = await repo.save_receipt(user_id, result, "text")
-    await update.message.reply_text(_format_confirmation(saved))
+    await update.message.reply_text(
+        _format_confirmation(saved), reply_markup=saved_keyboard(saved["id"])
+    )
 
 
 async def handle_callback(
@@ -276,6 +285,14 @@ async def handle_callback(
         receipt_id = int(data.split(":")[1])
         await repo.soft_delete(receipt_id)
         await query.edit_message_text(f"🗑 Receipt #{receipt_id} discarded.")
+
+    elif data.startswith("del:"):
+        receipt_id = int(data.split(":")[1])
+        await repo.soft_delete(receipt_id)
+        context.user_data["last_deleted"] = receipt_id  # type: ignore[index]
+        await query.edit_message_text(
+            f"🗑 Receipt #{receipt_id} deleted. Send /undo to restore."
+        )
 
     elif data.startswith("dup_skip:"):
         sha = data.split(":", 1)[1]
@@ -458,7 +475,9 @@ async def _save_and_reply(
             reply_markup=confirm_keyboard(receipt_id),
         )
     else:
-        await update.message.reply_text(_format_confirmation(saved))
+        await update.message.reply_text(
+            _format_confirmation(saved), reply_markup=saved_keyboard(receipt_id)
+        )
 
     # Offer to merge if a recent receipt on the same date looks like the same payment
     candidate = await repo.find_merge_candidate(user_id, result.date, saved)
