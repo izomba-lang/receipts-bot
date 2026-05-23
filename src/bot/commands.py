@@ -533,7 +533,7 @@ def build_forwardable_summary(trip: dict[str, Any], res: dict[str, Any]) -> str:
     start = trip["start_date"]
     end = trip["end_date"]
     return (
-        f"📋 Авансовый отчёт — {trip['name']}\n"
+        f"📋 Отчёт по затратам к возмещению — {trip['name']}\n"
         f"🗓 {start} — {end}\n\n"
         f"Все чеки и итоговый отчёт (Excel) с пересчётом в AED:\n"
         f"{res['share_url']}\n\n"
