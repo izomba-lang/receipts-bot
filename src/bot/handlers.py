@@ -10,6 +10,8 @@ from telegram.ext import ContextTypes
 from src.bot.keyboards import (
     confirm_keyboard,
     duplicate_keyboard,
+    edit_category_keyboard,
+    edit_field_keyboard,
     merge_keyboard,
     saved_keyboard,
 )
@@ -17,6 +19,16 @@ from src.extraction.claude_client import ClaudeExtractor
 from src.extraction.schemas import ExtractedReceipt, ExtractionError
 from src.storage.repository import ReceiptRepository
 from src.utils.dedup import sha256_digest
+
+FIELD_LABELS = {
+    "amount": "amount (e.g. 600 or 550.50)",
+    "currency": "currency (ISO code, e.g. ILS, GEL, AMD, EUR)",
+    "provider": "provider name",
+    "date": "date (YYYY-MM-DD)",
+    "from_location": "from location",
+    "to_location": "to location",
+    "payment_method": "payment method",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +235,16 @@ async def handle_text_message(
     if text.startswith("/"):
         return
 
-    extractor: ClaudeExtractor = context.bot_data["extractor"]
     repo: ReceiptRepository = context.bot_data["repo"]
+
+    # If an edit dialog is awaiting a value, consume this message as that value.
+    pending = context.user_data.get("pending_edit")  # type: ignore[union-attr]
+    if pending:
+        await _apply_pending_edit(update, repo, pending, text)
+        context.user_data.pop("pending_edit", None)  # type: ignore[union-attr]
+        return
+
+    extractor: ClaudeExtractor = context.bot_data["extractor"]
     user_id = str(update.effective_user.id)  # type: ignore[union-attr]
     anchor = date.today().isoformat()
 
@@ -292,6 +312,42 @@ async def handle_callback(
         context.user_data["last_deleted"] = receipt_id  # type: ignore[index]
         await query.edit_message_text(
             f"🗑 Receipt #{receipt_id} deleted. Send /undo to restore."
+        )
+
+    elif data.startswith("edit:"):
+        receipt_id = int(data.split(":")[1])
+        await query.edit_message_text(
+            f"✏️ Editing receipt #{receipt_id}. Which field?",
+            reply_markup=edit_field_keyboard(receipt_id),
+        )
+
+    elif data.startswith("edit_cancel:"):
+        context.user_data.pop("pending_edit", None)  # type: ignore[union-attr]
+        await query.edit_message_text("Edit cancelled.")
+
+    elif data.startswith("editf:"):
+        _, rid_s, field = data.split(":", 2)
+        receipt_id = int(rid_s)
+        if field == "category":
+            await query.edit_message_text(
+                f"Pick a category for #{receipt_id}:",
+                reply_markup=edit_category_keyboard(receipt_id),
+            )
+        else:
+            context.user_data["pending_edit"] = {  # type: ignore[index]
+                "id": receipt_id, "field": field
+            }
+            await query.edit_message_text(
+                f"✏️ Send the new {FIELD_LABELS.get(field, field)} for #{receipt_id}.\n"
+                f"(or /cancel)"
+            )
+
+    elif data.startswith("editv:"):
+        _, rid_s, field, value = data.split(":", 3)
+        receipt_id = int(rid_s)
+        await repo.update_receipt(receipt_id, {field: value})
+        await query.edit_message_text(
+            f"✅ #{receipt_id}: {field} → {value}"
         )
 
     elif data.startswith("dup_skip:"):
@@ -398,6 +454,40 @@ async def handle_callback(
 
     elif data.startswith("merge_no:"):
         await query.edit_message_text("Kept as separate receipts.")
+
+
+async def _apply_pending_edit(
+    update: Update, repo: ReceiptRepository, pending: dict[str, Any], value: str
+) -> None:
+    assert update.message
+    receipt_id = pending["id"]
+    field = pending["field"]
+    value = value.strip()
+
+    if field == "amount":
+        try:
+            amt = float(value.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("❌ Amount must be a number. Try /edit again.")
+            return
+        if amt <= 0:
+            await update.message.reply_text("❌ Amount must be positive.")
+            return
+        stored: Any = f"{amt:.2f}"
+    elif field == "date":
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            await update.message.reply_text("❌ Date must be YYYY-MM-DD.")
+            return
+        stored = value
+    elif field == "currency":
+        stored = value.upper()
+    else:
+        stored = value
+
+    await repo.update_receipt(receipt_id, {field: stored})
+    await update.message.reply_text(f"✅ #{receipt_id}: {field} → {stored}")
 
 
 async def _extract_pending(
