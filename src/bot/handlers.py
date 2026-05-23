@@ -467,9 +467,10 @@ async def _save_and_reply(
         cand_curr = candidate.get("currency", "")
         cand_provider = candidate.get("provider") or "—"
         await update.message.reply_text(
-            f"🔗 This looks like the same payment as #{candidate['id']} "
-            f"({cand_provider} · {float(cand_amount):,.2f} {cand_curr}).\n"
-            f"Merge them? The larger amount counts; the other becomes a "
+            f"🔗 Same amount as #{candidate['id']} "
+            f"({cand_provider} · {float(cand_amount):,.2f} {cand_curr}) — "
+            f"looks like the same payment (bill + receipt).\n"
+            f"Merge? One stays as the counted receipt; the other becomes a "
             f"supporting document (not double-counted).",
             reply_markup=merge_keyboard(receipt_id, candidate["id"]),
         )

@@ -283,12 +283,11 @@ class ReceiptRepository:
     async def find_merge_candidate(
         self, user_id: str, on_date: date, new_receipt: dict[str, Any],
         within_minutes: int = 3,
-        min_amount_ratio: float = 0.6,
     ) -> dict[str, Any] | None:
-        """Find a recently-captured receipt that is plausibly the SAME payment
-        as the new one (bill + fiscal receipt). Requires same date, same
-        currency, close capture time, and similar amount — to avoid matching
-        unrelated receipts during a bulk upload."""
+        """Find a recently-captured receipt that is the SAME payment as the new
+        one (bill + fiscal receipt). Requires same date, same currency, the EXACT
+        same amount, and close capture time — to avoid matching unrelated
+        receipts during a bulk upload."""
         created_raw = new_receipt.get("created_at")
         if not created_raw:
             return None
@@ -318,21 +317,15 @@ class ReceiptRepository:
             limit=10,
         )
 
-        # Among same-currency, recent candidates, pick the closest amount that
-        # is within the ratio band (bill ≈ fiscal receipt, differ by tip only).
-        best: dict[str, Any] | None = None
-        best_ratio = 0.0
+        # Only an exact amount match counts as the same payment.
         for r in rows:
             try:
                 amt = float(r.get("amount") or 0)
             except (TypeError, ValueError):
                 continue
-            if amt <= 0:
-                continue
-            ratio = min(amt, new_amount) / max(amt, new_amount)
-            if ratio >= min_amount_ratio and ratio > best_ratio:
-                best, best_ratio = r, ratio
-        return best
+            if abs(amt - new_amount) < 0.01:
+                return r
+        return None
 
     async def merge_receipts(
         self, primary_id: int, attachment_id: int
