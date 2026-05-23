@@ -119,7 +119,8 @@ def main() -> None:
     loop.run_until_complete(run_healthcheck_server())
 
     logger.info("Starting bot (long polling)…")
-    app.run_polling(drop_pending_updates=True)
+    # Keep pending updates so messages queued while the bot was down get processed.
+    app.run_polling(drop_pending_updates=False)
 
 
 if __name__ == "__main__":
