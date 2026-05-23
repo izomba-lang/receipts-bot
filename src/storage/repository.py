@@ -208,6 +208,7 @@ class ReceiptRepository:
             "trips",
             filters={
                 "user_id": f"eq.{user_id}",
+                "closed_at": "is.null",
                 "and": (
                     f"(start_date.lte.{on_date.isoformat()},"
                     f"end_date.gte.{on_date.isoformat()})"
@@ -217,6 +218,40 @@ class ReceiptRepository:
             limit=1,
         )
         return rows[0] if rows else None
+
+    async def find_open_trip(self, user_id: str) -> dict[str, Any] | None:
+        """Most recent trip that hasn't been closed yet."""
+        rows = await self._db.select(
+            "trips",
+            filters={
+                "user_id": f"eq.{user_id}",
+                "closed_at": "is.null",
+            },
+            order="start_date.desc",
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def close_trip(self, trip_id: int) -> dict[str, Any]:
+        return await self._db.update(
+            "trips", {"id": trip_id},
+            {"closed_at": datetime.utcnow().isoformat()},
+        )
+
+    async def trip_has_foreign_receipts(
+        self, user_id: str, trip_id: int, home_currency: str = "ILS"
+    ) -> bool:
+        rows = await self._db.select(
+            "receipts",
+            filters={
+                "user_id": f"eq.{user_id}",
+                "trip_id": f"eq.{trip_id}",
+                "status": "neq.deleted",
+                "currency": f"neq.{home_currency}",
+            },
+            limit=1,
+        )
+        return bool(rows)
 
     async def find_trip_by_name(
         self, user_id: str, query: str

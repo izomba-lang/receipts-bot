@@ -18,6 +18,7 @@ from telegram.ext import (
 
 from src.bot.commands import (
     handle_cancel,
+    handle_close,
     handle_delete,
     handle_edit,
     handle_export,
@@ -91,6 +92,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", handle_cancel))
     app.add_handler(CommandHandler("trip", handle_trip))
     app.add_handler(CommandHandler("export", handle_export))
+    app.add_handler(CommandHandler("close", handle_close))
     app.add_handler(CommandHandler("merge", handle_merge))
     app.add_handler(CommandHandler("unmerge", handle_unmerge))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))

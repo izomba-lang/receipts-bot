@@ -350,6 +350,34 @@ async def handle_callback(
             f"✅ #{receipt_id}: {field} → {value}"
         )
 
+    elif data.startswith("close:"):
+        from src.bot.commands import run_trip_export
+
+        trip_id = int(data.split(":")[1])
+        user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+        trip = await repo.get_trip(user_id, trip_id)
+        if not trip:
+            await query.edit_message_text("Trip not found.")
+            return
+        if trip.get("closed_at"):
+            await query.edit_message_text(f"Trip \"{trip['name']}\" is already closed.")
+            return
+        sb = context.bot_data["sb_client"]
+        await query.edit_message_text(
+            f"🏁 Closing \"{trip['name']}\" and generating the final report…"
+        )
+        try:
+            summary = await run_trip_export(repo, sb, user_id, trip)
+        except ValueError as e:
+            await query.edit_message_text(f"❌ {e}")
+            return
+        await repo.close_trip(trip_id)
+        if query.message:
+            await query.message.reply_text(
+                f"{summary}\n\n🏁 Trip \"{trip['name']}\" closed.",
+                disable_web_page_preview=True,
+            )
+
     elif data.startswith("dup_skip:"):
         sha = data.split(":", 1)[1]
         context.user_data.pop(f"dup_{sha}", None)  # type: ignore[union-attr]
@@ -555,6 +583,8 @@ async def _save_and_reply(
     receipt_id = saved["id"]
     await repo.update_receipt(receipt_id, {"notes": f"sha256:{sha}"})
 
+    open_trip_id = saved.get("trip_id")
+
     if status == "pending_review":
         await update.message.reply_text(
             f"🔍 Low confidence extraction for #{receipt_id}:\n\n"
@@ -566,7 +596,8 @@ async def _save_and_reply(
         )
     else:
         await update.message.reply_text(
-            _format_confirmation(saved), reply_markup=saved_keyboard(receipt_id)
+            _format_confirmation(saved),
+            reply_markup=saved_keyboard(receipt_id, open_trip_id=open_trip_id),
         )
 
     # Offer to merge if a recent receipt on the same date looks like the same payment
@@ -582,4 +613,17 @@ async def _save_and_reply(
             f"Merge? One stays as the counted receipt; the other becomes a "
             f"supporting document (not double-counted).",
             reply_markup=merge_keyboard(receipt_id, candidate["id"]),
+        )
+
+    # Return-transfer heuristic: home-currency taxi after foreign spend → offer to close
+    if (
+        open_trip_id
+        and result.category == "taxi"
+        and result.currency.upper() == "ILS"
+        and await repo.trip_has_foreign_receipts(user_id, open_trip_id)
+    ):
+        await update.message.reply_text(
+            "🏁 Looks like a return transfer home. "
+            "Close the trip and generate the final report?",
+            reply_markup=saved_keyboard(receipt_id, open_trip_id=open_trip_id),
         )

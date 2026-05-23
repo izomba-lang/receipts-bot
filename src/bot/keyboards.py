@@ -23,13 +23,20 @@ def duplicate_keyboard(sha: str) -> InlineKeyboardMarkup:
     ])
 
 
-def saved_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{receipt_id}"),
-            InlineKeyboardButton("🗑 Delete", callback_data=f"del:{receipt_id}"),
-        ]
-    ])
+def saved_keyboard(
+    receipt_id: int, open_trip_id: int | None = None
+) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("✏️ Edit", callback_data=f"edit:{receipt_id}"),
+        InlineKeyboardButton("🗑 Delete", callback_data=f"del:{receipt_id}"),
+    ]]
+    if open_trip_id is not None:
+        rows.append([
+            InlineKeyboardButton(
+                "🏁 Close trip", callback_data=f"close:{open_trip_id}"
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 # Fields offered in the edit dialog: (label, field_key)

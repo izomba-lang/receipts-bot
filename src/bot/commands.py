@@ -430,6 +430,81 @@ def _receipt_filename(idx: int, r: dict[str, Any]) -> str:
     return f"{idx:02d}_{d}_{provider}_{float(amount):.0f}{currency}.{ext}"
 
 
+async def run_trip_export(
+    repo: ReceiptRepository, sb: SupabaseClient, user_id: str, trip: dict[str, Any]
+) -> str:
+    """Build the xlsx report + upload all originals to a Drive folder.
+    Returns a summary string with the shareable link. Raises if no receipts."""
+    receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+    all_files = await repo.get_receipts_by_trip(
+        user_id, trip["id"], include_attachments=True
+    )
+    if not receipts:
+        raise ValueError("Trip has no receipts.")
+
+    start = date.fromisoformat(trip["start_date"])
+    end = date.fromisoformat(trip["end_date"])
+
+    drive = DriveClient()
+    expenses_root = drive.find_or_create_folder("Expenses")
+    folder_name = f"{trip['name']} ({trip['start_date']} → {trip['end_date']})"
+    folder_id = drive.create_folder(folder_name, parent_id=expenses_root)
+    logger.info(
+        "Created Drive folder %s inside Expenses (%s/%s)",
+        folder_name, expenses_root, folder_id,
+    )
+
+    fx = FxRateProvider()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx_path = Path(tmp) / f"{_safe_filename(trip['name'])}_report.xlsx"
+            await build_report(
+                receipts, start, end, xlsx_path, fx, title_override=trip["name"]
+            )
+            drive.upload_file(
+                xlsx_path.name,
+                xlsx_path.read_bytes(),
+                folder_id,
+                mime_type=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+    finally:
+        await fx.close()
+
+    uploaded = 0
+    skipped = 0
+    for idx, r in enumerate(all_files, 1):
+        src = r.get("source_file_id")
+        if not src:
+            skipped += 1
+            continue
+        try:
+            data = await sb.download_file(src)
+            fname = _receipt_filename(idx, r)
+            if r.get("parent_id"):
+                stem, _, ext = fname.rpartition(".")
+                fname = f"{stem}_attachment.{ext}"
+            drive.upload_file(fname, data, folder_id)
+            uploaded += 1
+        except Exception as e:
+            logger.error("Failed to upload receipt #%d: %s", r.get("id"), e)
+            skipped += 1
+
+    share_url = drive.make_shareable(folder_id)
+    n_attach = len(all_files) - len(receipts)
+    return (
+        f"✅ Export complete: \"{trip['name']}\"\n\n"
+        f"📊 Report: 1 xlsx\n"
+        f"🧾 Receipts: {uploaded} uploaded"
+        f"{f' (incl. {n_attach} attachments)' if n_attach else ''}"
+        f"{f', {skipped} skipped (no original)' if skipped else ''}\n\n"
+        f"🔗 {share_url}\n\n"
+        f"Anyone with the link can view."
+    )
+
+
 @owner_only
 async def handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.message
@@ -451,86 +526,40 @@ async def handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ Trip not found: {query}")
         return
 
-    # report rows exclude attachments (no double-counting); file upload includes all
-    receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
-    all_files = await repo.get_receipts_by_trip(
-        user_id, trip["id"], include_attachments=True
-    )
-    if not receipts:
-        await update.message.reply_text("Trip has no receipts.")
+    await update.message.reply_text(f"📤 Exporting \"{trip['name']}\"…")
+    try:
+        summary = await run_trip_export(repo, sb, user_id, trip)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+    await update.message.reply_text(summary, disable_web_page_preview=True)
+
+
+@owner_only
+async def handle_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    sb: SupabaseClient = context.bot_data["sb_client"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    trip = await repo.find_open_trip(user_id)
+    if not trip:
+        await update.message.reply_text("No open trip to close.")
         return
 
-    n_attach = len(all_files) - len(receipts)
     await update.message.reply_text(
-        f"📤 Exporting {len(receipts)} receipts"
-        f"{f' (+{n_attach} attachments)' if n_attach else ''} "
-        f"for \"{trip['name']}\"…"
+        f"🏁 Closing \"{trip['name']}\" and generating the final report…"
     )
-
-    start = date.fromisoformat(trip["start_date"])
-    end = date.fromisoformat(trip["end_date"])
-
-    drive = DriveClient()
-    expenses_root = drive.find_or_create_folder("Expenses")
-    folder_name = f"{trip['name']} ({trip['start_date']} → {trip['end_date']})"
-    folder_id = drive.create_folder(folder_name, parent_id=expenses_root)
-    logger.info(
-        "Created Drive folder %s inside Expenses (%s/%s)",
-        folder_name, expenses_root, folder_id,
-    )
-
-    # Build and upload the xlsx report
-    fx = FxRateProvider()
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            xlsx_path = Path(tmp) / f"{_safe_filename(trip['name'])}_report.xlsx"
-            await build_report(
-                receipts, start, end, xlsx_path, fx, title_override=trip["name"]
-            )
-            drive.upload_file(
-                xlsx_path.name,
-                xlsx_path.read_bytes(),
-                folder_id,
-                mime_type=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-            )
-    finally:
-        await fx.close()
-
-    # Download and upload every original (primary receipts + their attachments)
-    uploaded = 0
-    skipped = 0
-    for idx, r in enumerate(all_files, 1):
-        src = r.get("source_file_id")
-        if not src:
-            skipped += 1
-            continue
-        try:
-            data = await sb.download_file(src)
-            suffix = "_attachment" if r.get("parent_id") else ""
-            fname = _receipt_filename(idx, r)
-            if suffix:
-                stem, _, ext = fname.rpartition(".")
-                fname = f"{stem}{suffix}.{ext}"
-            drive.upload_file(fname, data, folder_id)
-            uploaded += 1
-        except Exception as e:
-            logger.error("Failed to upload receipt #%d: %s", r.get("id"), e)
-            skipped += 1
-
-    share_url = drive.make_shareable(folder_id)
-
-    summary = (
-        f"✅ Export complete: \"{trip['name']}\"\n\n"
-        f"📊 Report: 1 xlsx\n"
-        f"🧾 Receipts: {uploaded} uploaded"
-        f"{f', {skipped} skipped (no original)' if skipped else ''}\n\n"
-        f"🔗 {share_url}\n\n"
-        f"Anyone with the link can view."
+        summary = await run_trip_export(repo, sb, user_id, trip)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+    await repo.close_trip(trip["id"])
+    await update.message.reply_text(
+        f"{summary}\n\n🏁 Trip \"{trip['name']}\" closed.",
+        disable_web_page_preview=True,
     )
-    await update.message.reply_text(summary, disable_web_page_preview=True)
 
 
 @owner_only
