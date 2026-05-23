@@ -282,15 +282,26 @@ class ReceiptRepository:
 
     async def find_merge_candidate(
         self, user_id: str, on_date: date, new_receipt: dict[str, Any],
-        within_minutes: int = 5,
+        within_minutes: int = 3,
+        min_amount_ratio: float = 0.6,
     ) -> dict[str, Any] | None:
-        """Find a recently-captured receipt on the same date that the new one
-        likely belongs to (same payment: bill + fiscal receipt)."""
+        """Find a recently-captured receipt that is plausibly the SAME payment
+        as the new one (bill + fiscal receipt). Requires same date, same
+        currency, close capture time, and similar amount — to avoid matching
+        unrelated receipts during a bulk upload."""
         created_raw = new_receipt.get("created_at")
         if not created_raw:
             return None
         created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
         cutoff = (created - timedelta(minutes=within_minutes)).isoformat()
+
+        new_currency = (new_receipt.get("currency") or "").upper()
+        try:
+            new_amount = float(new_receipt.get("amount") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not new_currency or new_amount <= 0:
+            return None
 
         rows = await self._db.select(
             "receipts",
@@ -300,12 +311,28 @@ class ReceiptRepository:
                 "status": "neq.deleted",
                 "parent_id": "is.null",
                 "id": f"neq.{new_receipt['id']}",
+                "currency": f"eq.{new_currency}",
                 "created_at": f"gte.{cutoff}",
             },
             order="created_at.desc",
-            limit=1,
+            limit=10,
         )
-        return rows[0] if rows else None
+
+        # Among same-currency, recent candidates, pick the closest amount that
+        # is within the ratio band (bill ≈ fiscal receipt, differ by tip only).
+        best: dict[str, Any] | None = None
+        best_ratio = 0.0
+        for r in rows:
+            try:
+                amt = float(r.get("amount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if amt <= 0:
+                continue
+            ratio = min(amt, new_amount) / max(amt, new_amount)
+            if ratio >= min_amount_ratio and ratio > best_ratio:
+                best, best_ratio = r, ratio
+        return best
 
     async def merge_receipts(
         self, primary_id: int, attachment_id: int
