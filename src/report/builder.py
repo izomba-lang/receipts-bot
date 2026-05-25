@@ -35,6 +35,23 @@ HEADERS = [
 ]
 
 
+async def compute_aed_total(
+    receipts: list[dict[str, Any]], fx_provider: FxRateProvider
+) -> float:
+    """Sum all receipts converted to AED using per-date mid-market rates —
+    matches the report's AED TOTAL."""
+    total = Decimal("0")
+    for r in receipts:
+        d = r["date"]
+        if isinstance(d, str):
+            d = date.fromisoformat(d)
+        currency = (r.get("currency") or "AED").upper()
+        amount = Decimal(str(r["amount"]))
+        rate = await fx_provider.get_rate(d, currency)
+        total += amount * rate
+    return float(round(total, 2))
+
+
 def _build_description(row: dict[str, Any]) -> str:
     cat = (row.get("category") or "other").capitalize()
     time_str = row.get("time") or ""

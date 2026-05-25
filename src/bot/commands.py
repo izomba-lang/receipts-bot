@@ -12,8 +12,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from src.bot.handlers import CURRENCY_SYMBOLS, owner_only
+from src.config import Config
 from src.export.drive import DriveClient
-from src.report.builder import build_report
+from src.integrations.pyrus import PyrusClient, build_payment_payload
+from src.report.builder import build_report, compute_aed_total
 from src.report.fx import FxRateProvider
 from src.storage.repository import ReceiptRepository
 from src.storage.supabase_client import SupabaseClient
@@ -662,3 +664,133 @@ async def handle_unmerge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(
         f"✅ #{receipt_id} is a standalone receipt again (counts in totals)."
     )
+
+
+@owner_only
+async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message
+    repo: ReceiptRepository = context.bot_data["repo"]
+    config: Config = context.bot_data["config"]
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    if not config.pyrus_login or not config.pyrus_security_key:
+        await update.message.reply_text("Pyrus is not configured (missing credentials).")
+        return
+
+    args = context.args
+    if not args or not args[0].startswith("trip:"):
+        await update.message.reply_text("Usage: /pyrus trip:<name|id>")
+        return
+
+    trip = await _resolve_trip(repo, user_id, args[0][len("trip:"):])
+    if not trip:
+        await update.message.reply_text(f"❌ Trip not found: {args[0][len('trip:'):]}")
+        return
+
+    receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+    if not receipts:
+        await update.message.reply_text("Trip has no receipts.")
+        return
+
+    fx = FxRateProvider()
+    try:
+        aed_total = await compute_aed_total(receipts, fx)
+    finally:
+        await fx.close()
+
+    rub = round(aed_total * 24, 2)
+    payment_date = trip["end_date"]
+    purpose = f"flights, taxi and meals during business trip ({trip['name']})"
+
+    # Stash for the confirm callback
+    token = uuid.uuid4().hex[:8]
+    context.user_data[f"pyrus_{token}"] = {  # type: ignore[index]
+        "trip_id": trip["id"],
+        "aed_total": aed_total,
+        "payment_date": payment_date,
+        "purpose": purpose,
+    }
+
+    preview = (
+        f"📨 Pyrus ticket preview — form «Payment. UAE»\n\n"
+        f"• Company: DODO BRANDS INTERNATIONAL DMCC\n"
+        f"• Counterparty: Ilia Zomba\n"
+        f"• Purpose: {purpose}\n"
+        f"• Type: Reimbursement\n"
+        f"• Department: Dodo Pizza.IMF.Platform\n"
+        f"• Market: Dodo Pizza.International Region (w/o MENA)\n"
+        f"• Expense type: Business trips_Other\n"
+        f"• Amount: {aed_total:,.2f} AED\n"
+        f"• Amount in RUB: {rub:,.2f} (rate 24)\n"
+        f"• Payment date: {payment_date}\n"
+        f"• Attachment: Excel report\n"
+        f"• Bank details: left empty (filled downstream)\n\n"
+        f"Approval route applies automatically. Create the ticket?"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📨 Create ticket", callback_data=f"pyrus_go:{token}"),
+        InlineKeyboardButton("✖️ Cancel", callback_data=f"pyrus_no:{token}"),
+    ]])
+    await update.message.reply_text(preview, reply_markup=kb)
+
+
+async def create_pyrus_ticket(
+    repo: ReceiptRepository, sb: SupabaseClient, config: Config,
+    user_id: str, data: dict[str, Any],
+) -> str:
+    """Build the xlsx, upload to Pyrus, create the reimbursement task.
+    Returns the Pyrus task URL."""
+    trip = await repo.get_trip(user_id, data["trip_id"])
+    if not trip:
+        raise ValueError("Trip not found.")
+    receipts = await repo.get_receipts_by_trip(user_id, trip["id"])
+
+    all_files = await repo.get_receipts_by_trip(
+        user_id, trip["id"], include_attachments=True
+    )
+
+    pyrus = PyrusClient(config.pyrus_login, config.pyrus_security_key)
+    fx = FxRateProvider()
+    try:
+        guids: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            xlsx_path = Path(tmp) / f"{_safe_filename(trip['name'])}_report.xlsx"
+            await build_report(
+                receipts,
+                date.fromisoformat(trip["start_date"]),
+                date.fromisoformat(trip["end_date"]),
+                xlsx_path, fx, title_override=trip["name"],
+            )
+            guids.append(
+                await pyrus.upload_file(xlsx_path.name, xlsx_path.read_bytes())
+            )
+
+        # Upload every original receipt (photos/PDFs) too
+        for idx, r in enumerate(all_files, 1):
+            src = r.get("source_file_id")
+            if not src:
+                continue
+            try:
+                content = await sb.download_file(src)
+                fname = _receipt_filename(idx, r)
+                if r.get("parent_id"):
+                    stem, _, ext = fname.rpartition(".")
+                    fname = f"{stem}_attachment.{ext}"
+                guids.append(await pyrus.upload_file(fname, content))
+            except Exception as e:
+                logger.error("Pyrus: failed to upload receipt #%s: %s", r.get("id"), e)
+
+        payload = build_payment_payload(
+            purpose=data["purpose"],
+            aed_total=data["aed_total"],
+            payment_date=data["payment_date"],
+            counterparty_name=config.pyrus_counterparty_name or "",
+            receipt_guids=guids,
+            assistant_person_id=config.pyrus_assistant_person_id,
+        )
+        result = await pyrus.create_task(payload)
+        task_id = result.get("task", {}).get("id")
+        return f"https://pyrus.com/t#id{task_id}"
+    finally:
+        await fx.close()
+        await pyrus.close()

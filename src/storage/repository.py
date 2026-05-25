@@ -271,6 +271,7 @@ class ReceiptRepository:
         rows = await self._db.select(
             "trips",
             filters={"user_id": f"eq.{user_id}", "id": f"eq.{trip_id}"},
+            order="id.asc",
             limit=1,
         )
         return rows[0] if rows else None

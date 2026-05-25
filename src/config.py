@@ -14,6 +14,10 @@ class Config:
     supabase_service_key: str
     supabase_bucket: str
     log_level: str
+    pyrus_login: str | None
+    pyrus_security_key: str | None
+    pyrus_counterparty_name: str | None
+    pyrus_assistant_person_id: int | None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -34,4 +38,12 @@ class Config:
             supabase_service_key=_require("SUPABASE_SERVICE_KEY"),
             supabase_bucket=os.environ.get("SUPABASE_BUCKET", "receipts"),
             log_level=os.environ.get("LOG_LEVEL", "INFO"),
+            pyrus_login=os.environ.get("PYRUS_LOGIN"),
+            pyrus_security_key=os.environ.get("PYRUS_SECURITY_KEY"),
+            pyrus_counterparty_name=os.environ.get("PYRUS_COUNTERPARTY_NAME"),
+            pyrus_assistant_person_id=(
+                int(os.environ["PYRUS_ASSISTANT_PERSON_ID"])
+                if os.environ.get("PYRUS_ASSISTANT_PERSON_ID")
+                else None
+            ),
         )

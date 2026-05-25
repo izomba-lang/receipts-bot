@@ -484,6 +484,34 @@ async def handle_callback(
     elif data.startswith("merge_no:"):
         await query.edit_message_text("Kept as separate receipts.")
 
+    elif data.startswith("pyrus_no:"):
+        token = data.split(":", 1)[1]
+        context.user_data.pop(f"pyrus_{token}", None)  # type: ignore[union-attr]
+        await query.edit_message_text("Pyrus ticket cancelled.")
+
+    elif data.startswith("pyrus_go:"):
+        from src.bot.commands import create_pyrus_ticket
+
+        token = data.split(":", 1)[1]
+        payload_data = context.user_data.pop(f"pyrus_{token}", None)  # type: ignore[union-attr]
+        if not payload_data:
+            await query.edit_message_text("Preview expired. Run /pyrus again.")
+            return
+        await query.edit_message_text("📨 Creating Pyrus ticket…")
+        user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+        config = context.bot_data["config"]
+        sb = context.bot_data["sb_client"]
+        try:
+            url = await create_pyrus_ticket(repo, sb, config, user_id, payload_data)
+        except Exception as e:
+            logger.error("Pyrus ticket creation failed: %s", e, exc_info=e)
+            await query.edit_message_text(f"❌ Failed to create ticket: {e}")
+            return
+        if query.message:
+            await query.message.reply_text(
+                f"✅ Pyrus ticket created:\n{url}", disable_web_page_preview=True
+            )
+
 
 async def _apply_pending_edit(
     update: Update, repo: ReceiptRepository, pending: dict[str, Any], value: str

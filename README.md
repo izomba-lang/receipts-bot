@@ -1,6 +1,16 @@
 # Receipts Bot
 
-Telegram bot that ingests expense receipts (photos, PDFs, text), extracts structured data via Claude Vision, stores them in Supabase, and generates AED expense reports (.xlsx).
+Telegram bot that ingests expense receipts (photos, PDFs, text), extracts structured data via Claude Vision, stores them in Supabase, and generates AED expense reports (.xlsx). Optionally files a reimbursement ticket in Pyrus on trip close.
+
+## Features
+
+- 📸 Receipt extraction from photos, PDFs, and free text via Claude (vision), any language
+- ✈️ Trips: group expenses by trip (auto-attach by date), close a trip to get a final report
+- 🔗 Merge a bill + fiscal receipt for one payment (no double-counting)
+- 🧠 Duplicate detection by file hash
+- 📊 AED .xlsx report with per-date mid-market FX conversion
+- ☁️ Export originals + report to a Google Drive folder with a shareable link
+- 🎫 Pyrus integration: file a reimbursement ticket with attachments on trip close (Dodo-specific, optional)
 
 ## Quick start
 
@@ -82,6 +92,27 @@ Also create a Storage bucket called `receipts` in Supabase Dashboard → Storage
 | `/delete <id>` | Soft-delete a receipt |
 | `/undo` | Restore last deleted |
 | `/cancel` | Clear pending state |
+
+## Pyrus integration (optional, Dodo-specific)
+
+On trip close the bot can file a reimbursement ticket in Pyrus (form "Payment. UAE"),
+attaching the .xlsx report + all original receipts and notifying an assistant.
+
+Set in `.env`:
+
+```env
+PYRUS_LOGIN=your.email@dodobrands.io
+PYRUS_SECURITY_KEY=...          # Pyrus profile → Authorization
+PYRUS_COUNTERPARTY_NAME=Your Name   # how you appear as the counterparty
+PYRUS_ASSISTANT_PERSON_ID=866453    # Pyrus person id to add as subscriber (optional)
+```
+
+The form id and catalog item ids (company, currency, department, market, expense
+type) are constants in `src/integrations/pyrus.py` — shared across Dodo, edit there
+if your form differs. Leave the Pyrus vars empty to disable the integration.
+
+Trigger manually with `/pyrus trip:<name>` — the bot shows a preview and creates the
+ticket only after you confirm.
 
 ## Development
 
