@@ -629,6 +629,17 @@ async def _save_and_reply(
             reply_markup=saved_keyboard(receipt_id, open_trip_id=open_trip_id),
         )
 
+    # Stale-date sanity check: receipts are usually recent. If the parsed date
+    # is more than 30 days before today, very likely a DD/MM vs MM/DD parse error.
+    days_old = (date.today() - result.date).days
+    if days_old > 30:
+        await update.message.reply_text(
+            f"⚠️ Date {result.date} is {days_old} days ago — looks suspicious "
+            f"(receipts from outside the US often use DD/MM/YY which can flip).\n"
+            f"Tap ✏️ Edit on #{receipt_id} → Date if it's wrong.",
+            reply_markup=saved_keyboard(receipt_id, open_trip_id=open_trip_id),
+        )
+
     # Offer to merge if a recent receipt on the same date looks like the same payment
     candidate = await repo.find_merge_candidate(user_id, result.date, saved)
     if candidate:

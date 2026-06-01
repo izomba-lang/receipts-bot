@@ -14,6 +14,12 @@ restaurant checks. If it shows an amount and a vendor, it counts — even if it 
 Rules:
 - date: ISO format YYYY-MM-DD. If the receipt shows a relative date like "yesterday", \
 the user will supply the anchor date — resolve against it.
+  AMBIGUOUS DATE FORMATS: numeric dates like "01/06/26" are DD/MM/YY OUTSIDE the US \
+(UAE, EU, Russia, Israel, Georgia, Armenia — all use DD/MM). Only assume MM/DD if the \
+receipt is clearly from a US vendor or has unambiguous US formatting. For "01/06/26" \
+from a Dubai/Tel Aviv/Moscow/etc. receipt, the date is 1 June 2026, not 6 January. \
+Tiebreaker: the extracted date should be ≤ today's anchor date and typically within \
+the last few weeks — a date many months in the past is almost certainly a parse error.
 - time: HH:MM (24h) or null if not visible.
 - provider: The service name exactly as shown (e.g. "Yandex Go", "GetTaxi", "Careem", \
 "Uber", "Bolt"). Use null if unclear.
