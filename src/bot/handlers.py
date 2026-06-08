@@ -351,7 +351,11 @@ async def handle_callback(
         )
 
     elif data.startswith("close:"):
-        from src.bot.commands import build_forwardable_summary, run_trip_export
+        from src.bot.commands import (
+            build_forwardable_summary,
+            run_trip_export,
+            send_pyrus_preview,
+        )
 
         trip_id = int(data.split(":")[1])
         user_id = str(update.effective_user.id)  # type: ignore[union-attr]
@@ -363,6 +367,7 @@ async def handle_callback(
             await query.edit_message_text(f"Trip \"{trip['name']}\" is already closed.")
             return
         sb = context.bot_data["sb_client"]
+        config = context.bot_data["config"]
         await query.edit_message_text(
             f"🏁 Closing \"{trip['name']}\" and generating the final report…"
         )
@@ -378,6 +383,10 @@ async def handle_callback(
                 build_forwardable_summary(trip, res),
                 disable_web_page_preview=True,
             )
+            if config.pyrus_login and config.pyrus_security_key:
+                await send_pyrus_preview(
+                    update, context, trip, res["receipts"], config
+                )
 
     elif data.startswith("dup_skip:"):
         sha = data.split(":", 1)[1]

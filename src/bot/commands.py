@@ -584,6 +584,7 @@ async def handle_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     assert update.message
     repo: ReceiptRepository = context.bot_data["repo"]
     sb: SupabaseClient = context.bot_data["sb_client"]
+    config: Config = context.bot_data["config"]
     user_id = str(update.effective_user.id)  # type: ignore[union-attr]
 
     trip = await repo.find_open_trip(user_id)
@@ -607,6 +608,9 @@ async def handle_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         build_forwardable_summary(trip, res), disable_web_page_preview=True
     )
+    # Offer to file the Pyrus reimbursement ticket
+    if config.pyrus_login and config.pyrus_security_key:
+        await send_pyrus_preview(update, context, trip, res["receipts"], config)
 
 
 @owner_only
@@ -692,6 +696,20 @@ async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text("Trip has no receipts.")
         return
 
+    await send_pyrus_preview(update, context, trip, receipts, config)
+
+
+async def send_pyrus_preview(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    trip: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    config: Config,
+) -> None:
+    """Compute AED total, stash payload for confirm callback, send preview message."""
+    if not (update.message or update.effective_chat):
+        return
+
     fx = FxRateProvider()
     try:
         aed_total = await compute_aed_total(receipts, fx)
@@ -701,8 +719,8 @@ async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     rub = round(aed_total * 24, 2)
     payment_date = trip["end_date"]
     purpose = f"flights, taxi and meals during business trip ({trip['name']})"
+    counterparty = config.pyrus_counterparty_name or "—"
 
-    # Stash for the confirm callback
     token = uuid.uuid4().hex[:8]
     context.user_data[f"pyrus_{token}"] = {  # type: ignore[index]
         "trip_id": trip["id"],
@@ -714,7 +732,7 @@ async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     preview = (
         f"📨 Pyrus ticket preview — form «Payment. UAE»\n\n"
         f"• Company: DODO BRANDS INTERNATIONAL DMCC\n"
-        f"• Counterparty: Ilia Zomba\n"
+        f"• Counterparty: {counterparty}\n"
         f"• Purpose: {purpose}\n"
         f"• Type: Reimbursement\n"
         f"• Department: Dodo Pizza.IMF.Platform\n"
@@ -723,7 +741,7 @@ async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"• Amount: {aed_total:,.2f} AED\n"
         f"• Amount in RUB: {rub:,.2f} (rate 24)\n"
         f"• Payment date: {payment_date}\n"
-        f"• Attachment: Excel report\n"
+        f"• Attachments: Excel report + all original receipts\n"
         f"• Bank details: left empty (filled downstream)\n\n"
         f"Approval route applies automatically. Create the ticket?"
     )
@@ -731,7 +749,13 @@ async def handle_pyrus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         InlineKeyboardButton("📨 Create ticket", callback_data=f"pyrus_go:{token}"),
         InlineKeyboardButton("✖️ Cancel", callback_data=f"pyrus_no:{token}"),
     ]])
-    await update.message.reply_text(preview, reply_markup=kb)
+
+    if update.message:
+        await update.message.reply_text(preview, reply_markup=kb)
+    elif update.effective_chat:
+        await context.bot.send_message(
+            update.effective_chat.id, preview, reply_markup=kb
+        )
 
 
 async def create_pyrus_ticket(
