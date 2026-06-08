@@ -7,8 +7,13 @@ from typing import Any
 
 import anthropic
 
-from src.extraction.prompts import RECEIPT_EXTRACTION_SYSTEM, build_text_extraction_prompt
-from src.extraction.schemas import ExtractedReceipt, ExtractionError
+from src.extraction.prompts import (
+    RECEIPT_EXTRACTION_SYSTEM,
+    TRIP_PARSE_SYSTEM,
+    build_text_extraction_prompt,
+    build_trip_parse_prompt,
+)
+from src.extraction.schemas import ExtractedReceipt, ExtractedTripInfo, ExtractionError
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +61,30 @@ class ClaudeExtractor:
         prompt = build_text_extraction_prompt(text, anchor_date)
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         return await self._call(content)
+
+    async def extract_trip_info(
+        self, text: str, anchor_date: str
+    ) -> ExtractedTripInfo | ExtractionError:
+        prompt = build_trip_parse_prompt(text, anchor_date)
+        response = await self._client.messages.create(
+            model=self._model,
+            max_tokens=512,
+            system=TRIP_PARSE_SYSTEM,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return ExtractionError(error="trip_parse_invalid_json")
+        if "error" in data:
+            return ExtractionError(**data)
+        try:
+            return ExtractedTripInfo(**data)
+        except Exception as e:
+            return ExtractionError(error=f"trip_schema: {e}")
 
     async def _call(
         self, content: list[dict[str, Any]]

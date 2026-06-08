@@ -54,3 +54,28 @@ def build_text_extraction_prompt(text: str, anchor_date: str) -> str:
         f"Extract receipt data from this text, resolving relative dates against today.\n\n"
         f"Text: {text}"
     )
+
+
+TRIP_PARSE_SYSTEM = """\
+You parse a free-form description of an upcoming or current business trip into \
+structured fields. Return ONLY a JSON object — no markdown, no commentary.
+
+Fields:
+- name: a short trip name in English, format "<Destination> <Month> <Year>", e.g. \
+"Moscow June 2026", "Dubai+Abu Dhabi July 2026". Use the destination from the user's \
+text. If multiple cities, join with "+".
+- start_date: ISO YYYY-MM-DD. If the user gives a duration only (e.g. "a week", \
+"на 5 дней"), start = today's anchor date.
+- end_date: ISO YYYY-MM-DD. Resolve relative phrases ("until Friday", "до пятницы", \
+"on the 15th") against today's anchor date — pick the NEXT occurrence in the future.
+- If you cannot determine a destination or dates with reasonable confidence, return \
+{"error": "cannot_parse"}.
+
+The user writes in Russian or English, mixed. Both are fine.
+
+Return ONLY the JSON object.\
+"""
+
+
+def build_trip_parse_prompt(text: str, anchor_date: str) -> str:
+    return f"Today is {anchor_date}. The user wrote: {text}"

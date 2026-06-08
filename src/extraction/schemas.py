@@ -34,6 +34,12 @@ class ExtractionError(BaseModel):
     error: str
 
 
+class ExtractedTripInfo(BaseModel):
+    name: str
+    start_date: _dt.date
+    end_date: _dt.date
+
+
 class ReceiptRow(BaseModel):
     id: int
     user_id: str

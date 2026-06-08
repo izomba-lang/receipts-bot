@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from telegram import PhotoSize, Update
@@ -222,7 +222,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await _save_and_reply(
         update, repo, user_id, result, source_kind,
-        file_bytes, ext, content_type, sha,
+        file_bytes, ext, content_type, sha, context=context,
     )
 
 
@@ -247,6 +247,11 @@ async def handle_text_message(
     extractor: ClaudeExtractor = context.bot_data["extractor"]
     user_id = str(update.effective_user.id)  # type: ignore[union-attr]
     anchor = date.today().isoformat()
+
+    # If we asked the user about a new trip, treat the text as the trip description.
+    if context.user_data.get("awaiting_trip_creation"):  # type: ignore[union-attr]
+        await _try_create_trip_from_text(update, context, repo, extractor, text, anchor)
+        return
 
     result = await extractor.extract_from_text(text, anchor)
 
@@ -522,6 +527,51 @@ async def handle_callback(
             )
 
 
+async def _try_create_trip_from_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    repo: ReceiptRepository,
+    extractor: ClaudeExtractor,
+    text: str,
+    anchor: str,
+) -> None:
+    assert update.message
+    user_id = str(update.effective_user.id)  # type: ignore[union-attr]
+
+    info = await extractor.extract_trip_info(text, anchor)
+    if isinstance(info, ExtractionError):
+        await update.message.reply_text(
+            "🤷 Couldn't parse that as a trip. Try e.g. \"Москва на 5 дней\" or "
+            "\"Dubai until June 12\". Or use /trip new \"Name\" YYYY-MM-DD..YYYY-MM-DD."
+        )
+        return
+
+    if info.end_date < info.start_date:
+        await update.message.reply_text("❌ End date is before start date — try again.")
+        return
+
+    trip = await repo.create_trip(user_id, info.name, info.start_date, info.end_date)
+    context.user_data.pop("awaiting_trip_creation", None)  # type: ignore[union-attr]
+
+    # Auto-attach existing unassigned receipts in the trip range
+    unassigned = await repo.get_unassigned_receipts(user_id)
+    in_range = [
+        r for r in unassigned
+        if info.start_date <= date.fromisoformat(r["date"]) <= info.end_date
+    ]
+    for r in in_range:
+        await repo.assign_trip(r["id"], trip["id"])
+
+    msg = (
+        f"✈️ Trip created: #{trip['id']} \"{trip['name']}\" "
+        f"({trip['start_date']} → {trip['end_date']})"
+    )
+    if in_range:
+        msg += f"\n🔗 Auto-attached {len(in_range)} existing receipts."
+    msg += "\nAll new receipts in this range will attach automatically."
+    await update.message.reply_text(msg)
+
+
 async def _apply_pending_edit(
     update: Update, repo: ReceiptRepository, pending: dict[str, Any], value: str
 ) -> None:
@@ -595,7 +645,7 @@ async def _process_image(
 
     await _save_and_reply(
         update, repo, user_id, result, source_kind,
-        image_bytes, "jpg", "image/jpeg", sha,
+        image_bytes, "jpg", "image/jpeg", sha, context=context,
     )
 
 
@@ -609,6 +659,7 @@ async def _save_and_reply(
     ext: str,
     content_type: str,
     sha: str,
+    context: ContextTypes.DEFAULT_TYPE | None = None,
 ) -> None:
     assert update.message
     status = "pending_review" if result.confidence < 0.7 else "confirmed"
@@ -676,3 +727,29 @@ async def _save_and_reply(
             "Close the trip and generate the final report?",
             reply_markup=saved_keyboard(receipt_id, open_trip_id=open_trip_id),
         )
+
+    # No open trip + receipt date is recent → ask the user about a new trip
+    if (
+        context is not None
+        and not open_trip_id
+        and (date.today() - result.date).days <= 2
+    ):
+        pending = context.user_data.get("awaiting_trip_creation")  # type: ignore[union-attr]
+        # only prompt once per hour to avoid nagging on bulk uploads
+        recent_prompt = False
+        if isinstance(pending, dict):
+            try:
+                last = datetime.fromisoformat(pending["prompted_at"])
+                recent_prompt = (datetime.utcnow() - last).total_seconds() < 3600
+            except Exception:
+                recent_prompt = False
+        if not recent_prompt:
+            context.user_data["awaiting_trip_creation"] = {  # type: ignore[index]
+                "prompted_at": datetime.utcnow().isoformat(),
+            }
+            await update.message.reply_text(
+                "🆕 No open trip yet. If this is a new business trip, write where "
+                "you're going and for how long — e.g. \"Москва на 5 дней\" or "
+                "\"Dubai until June 12\". I'll create the trip and attach this "
+                "receipt + future ones automatically."
+            )
