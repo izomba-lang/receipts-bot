@@ -14,7 +14,7 @@ AUTH_URL = "https://accounts.pyrus.com/api/v4/auth"
 # the same for everyone submitting this form. Personal values (counterparty name,
 # the assistant to notify) are passed in from config / env, not hardcoded.
 FORM_ID = 1135007
-COMPANY_ITEM_ID = 103661856          # DODO BRANDS INTERNATIONAL DMCC
+COMPANY_ITEM_ID = 103661856          # DODO BRANDS INTERNATIONAL FZCO
 CURRENCY_AED_ITEM_ID = 96970640      # AED (catalog rate ~24)
 DEPARTMENT_ITEM_ID = 174735390       # Dodo Pizza.IMF.Platform
 MARKET_ITEM_ID = 175349073           # Dodo Pizza.International Region (w/o MENA)

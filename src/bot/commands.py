@@ -731,7 +731,7 @@ async def send_pyrus_preview(
 
     preview = (
         f"📨 Pyrus ticket preview — form «Payment. UAE»\n\n"
-        f"• Company: DODO BRANDS INTERNATIONAL DMCC\n"
+        f"• Company: DODO BRANDS INTERNATIONAL FZCO\n"
         f"• Counterparty: {counterparty}\n"
         f"• Purpose: {purpose}\n"
         f"• Type: Reimbursement\n"
