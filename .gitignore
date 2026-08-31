@@ -12,3 +12,6 @@ venv/
 .ruff_cache/
 .pytest_cache/
 CLAUDE.local.md
+
+# Personal receipt batch — originals with names, card numbers, addresses
+2026-07_08/
