@@ -13,6 +13,11 @@ the next pass.
     python scripts/ingest_2026_07_08.py --dry-run
     python scripts/ingest_2026_07_08.py
     python scripts/ingest_2026_07_08.py --verify-only
+
+Any later batch works the same way with ``--manifest <dir>/_ingest.json``. Its
+reconciliation targets come from the manifest's ``expect`` block
+(``rows``, ``report_rows``, ``currency_totals``, optional ``aed_total``);
+without one, the 2026-07/08 constants below apply.
 """
 
 from __future__ import annotations
@@ -65,6 +70,28 @@ AED_TOLERANCE = Decimal("0.02")  # ±2 %
 
 SHARED_BOOKING_FILE = "2026-08-04_RedWings_bilety_chek325_78390RUB.pdf"
 SHARED_BOOKING_SHARE = Decimal("21640.00")
+
+
+def expectations_for(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Reconciliation targets: the manifest's ``expect`` block, or the 2026-07/08
+    constants for the original manifest that predates it."""
+    spec = manifest.get("expect")
+    if spec is None:
+        return {
+            "rows": EXPECTED_ROWS,
+            "report_rows": EXPECTED_REPORT_ROWS,
+            "currency_totals": EXPECTED_CURRENCY_TOTALS,
+            "aed_total": EXPECTED_AED_TOTAL,
+        }
+    aed = spec.get("aed_total")
+    return {
+        "rows": int(spec["rows"]),
+        "report_rows": int(spec["report_rows"]),
+        "currency_totals": {
+            c.upper(): Decimal(str(v)) for c, v in spec["currency_totals"].items()
+        },
+        "aed_total": Decimal(str(aed)) if aed is not None else None,
+    }
 
 
 class ReconciliationError(RuntimeError):
@@ -285,12 +312,13 @@ async def reconcile(
         else:
             pairs.append((item, found))
     rows = [row for _, row in pairs]
+    expect = expectations_for(manifest)
 
     problems: list[str] = []
     if missing:
         problems.append(f"{len(missing)} manifest entries not in DB: {missing}")
-    if len(rows) != EXPECTED_ROWS:
-        problems.append(f"expected {EXPECTED_ROWS} rows, found {len(rows)}")
+    if len(rows) != expect["rows"]:
+        problems.append(f"expected {expect['rows']} rows, found {len(rows)}")
 
     deleted = [r["id"] for r in rows if r.get("status") == "deleted"]
     if deleted:
@@ -314,21 +342,21 @@ async def reconcile(
         problems.append(f"rows on the wrong trip: {wrong_trip}")
 
     reportable = [r for r in rows if not r.get("parent_id")]
-    if len(reportable) != EXPECTED_REPORT_ROWS:
+    if len(reportable) != expect["report_rows"]:
         problems.append(
-            f"expected {EXPECTED_REPORT_ROWS} reportable rows, found {len(reportable)}"
+            f"expected {expect['report_rows']} reportable rows, found {len(reportable)}"
         )
 
     totals: dict[str, Decimal] = defaultdict(Decimal)
     for r in reportable:
         totals[r["currency"].upper()] += Decimal(str(r["amount"]))
-    for currency, expected in EXPECTED_CURRENCY_TOTALS.items():
+    for currency, expected in expect["currency_totals"].items():
         actual = totals.get(currency, Decimal("0"))
         mark = "OK " if actual == expected else "!! "
         logger.info("%s%-4s expected %12s   actual %12s", mark, currency, expected, actual)
         if actual != expected:
             problems.append(f"{currency}: expected {expected}, got {actual}")
-    extra = set(totals) - set(EXPECTED_CURRENCY_TOTALS)
+    extra = set(totals) - set(expect["currency_totals"])
     if extra:
         problems.append(f"unexpected currencies: {sorted(extra)}")
 
@@ -362,19 +390,24 @@ async def reconcile(
     return reportable
 
 
-async def report_aed_total(reportable: list[dict[str, Any]]) -> None:
+async def report_aed_total(
+    reportable: list[dict[str, Any]], expected: Decimal | None
+) -> None:
     fx = FxRateProvider()
     try:
         total = Decimal(str(await compute_aed_total(reportable, fx)))
     finally:
         await fx.close()
-    delta = abs(total - EXPECTED_AED_TOTAL) / EXPECTED_AED_TOTAL
+    if expected is None:
+        logger.info("AED total: %s (no expected value in the manifest)", total)
+        return
+    delta = abs(total - expected) / expected
     logger.info("AED total: %s (expected ≈ %s, delta %.2f %%)",
-                total, EXPECTED_AED_TOTAL, delta * 100)
+                total, expected, delta * 100)
     if delta > AED_TOLERANCE:
         raise ReconciliationError(
             f"AED total {total} is {delta * 100:.2f} % off the expected "
-            f"{EXPECTED_AED_TOTAL} (tolerance ±{AED_TOLERANCE * 100:.0f} %)"
+            f"{expected} (tolerance ±{AED_TOLERANCE * 100:.0f} %)"
         )
 
 
@@ -410,7 +443,7 @@ async def main_async(args: argparse.Namespace) -> int:
         reportable = await reconcile(
             client, repo, user_id, manifest, trip_ids, check_storage=not args.skip_storage_check
         )
-        await report_aed_total(reportable)
+        await report_aed_total(reportable, expectations_for(manifest)["aed_total"])
     except ReconciliationError as exc:
         logger.error("%s", exc)
         return 1
